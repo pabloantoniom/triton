@@ -1384,6 +1384,112 @@ def test_amd_wmma_scaled_tdm(M, N, K, mxfp_type, hasScale, scale_dtype, scale_fa
     torch.testing.assert_close(z.cpu(), z_ref.cpu(), rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
+@pytest.mark.parametrize("M, N, K", [(64, 128, 128), (128, 128, 128), (128, 256, 256)])
+@pytest.mark.parametrize("with_a_scale, with_b_scale", itertools.product([True, False], repeat=2))
+def test_dot_scaled_fp4_asymmetric_pack(M, N, K, with_a_scale, with_b_scale):
+    # Runtime coverage for asymmetric mxfp4 packing (lhs_k_pack=True, rhs_k_pack=False)
+
+    @triton.jit
+    def dot_scaled_fp4_asymmetric_pack_kernel(  #
+            a_ptr, b_ptr, output_ptr,  #
+            a_scale, b_scale,  #
+            M, N, K,  #
+            stride_a_scale, stride_b_scale,  #
+            stride_am, stride_ak,  #
+            stride_bk, stride_bn,  #
+            stride_cm, stride_cn,  #
+            VEC_SIZE: tl.constexpr,  #
+            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+        # A is mxfp4 packed along K (lhs_k_pack=True)
+        # B is mxfp4 packed along N (rhs_k_pack=False)
+        pid = tl.program_id(axis=0)
+        num_pid_m = tl.cdiv(M, BLOCK_M)
+        pid_m = pid % num_pid_m
+        pid_n = pid // num_pid_m
+
+        offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_bn_packed = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
+        offs_ak = tl.arange(0, BLOCK_K // 2)
+        offs_bk = tl.arange(0, BLOCK_K)
+        offs_scale_k = tl.arange(0, BLOCK_K // VEC_SIZE)
+
+        if a_scale is not None:
+            a_scale_ptr = a_scale + offs_am[:, None] * stride_a_scale + offs_scale_k[None, :]
+        if b_scale is not None:
+            b_scale_ptr = b_scale + offs_bn[:, None] * stride_b_scale + offs_scale_k[None, :]
+
+        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)
+        b_ptrs = b_ptr + (offs_bk[:, None] * stride_bk + offs_bn_packed[None, :] * stride_bn)
+
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=output_ptr.dtype.element_ty)
+        for k in tl.range(0, tl.cdiv(K, BLOCK_K)):
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+            if a_scale is not None:
+                scale_a = tl.load(a_scale_ptr)
+            else:
+                scale_a = None
+            if b_scale is not None:
+                scale_b = tl.load(b_scale_ptr)
+            else:
+                scale_b = None
+            accumulator = tl.dot_scaled(a, scale_a, "e2m1", b, scale_b, "e2m1", accumulator, lhs_k_pack=True,
+                                        rhs_k_pack=False)
+            a_ptrs += (BLOCK_K // 2) * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+            if a_scale is not None:
+                a_scale_ptr += BLOCK_K // VEC_SIZE
+            if b_scale is not None:
+                b_scale_ptr += BLOCK_K // VEC_SIZE
+
+        offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        output_ptrs = output_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(output_ptrs, accumulator, mask=c_mask)
+
+    VEC_SIZE = 32
+    torch.manual_seed(42)
+
+    a_mxfp4 = MXFP4Tensor(size=(M, K)).random()
+    a = a_mxfp4.to_packed_tensor(dim=1).cuda()
+
+    b_mxfp4 = MXFP4Tensor(size=(N, K)).random()
+    b = b_mxfp4.to_packed_tensor(dim=0).T.cuda()
+    b_ref = b_mxfp4.to(torch.float32).T
+
+    a_size = (M, (K + VEC_SIZE - 1) // VEC_SIZE)
+    b_size = (N, (K + VEC_SIZE - 1) // VEC_SIZE)
+    a_scale_ref = MXScaleTensor(torch.rand(a_size))
+    b_scale_ref = MXScaleTensor(torch.rand(b_size))
+    a_scale = a_scale_ref.data.cuda()
+    b_scale = b_scale_ref.data.cuda()
+
+    a_scale_ref = a_scale_ref.to(torch.float32).repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
+    b_scale_ref = b_scale_ref.to(torch.float32).repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
+
+    stride_a_scale = a_scale.stride(0)
+    stride_b_scale = b_scale.stride(0)
+    if not with_a_scale:
+        a_scale = None
+        a_scale_ref = 1.0
+    if not with_b_scale:
+        b_scale = None
+        b_scale_ref = 1.0
+
+    ref_out = torch.matmul(a_mxfp4.to(torch.float32) * a_scale_ref, b_ref * b_scale_ref)
+
+    output = a.new_empty((M, N), dtype=torch.float32)
+    grid = (1, )
+    dot_scaled_fp4_asymmetric_pack_kernel[grid](a, b, output, a_scale, b_scale, M, N, K, stride_a_scale, stride_b_scale,
+                                                a.stride(0), a.stride(1), b.stride(0), b.stride(1), output.stride(0),
+                                                output.stride(1), VEC_SIZE, M, N, K, num_warps=4)
+
+    torch.testing.assert_close(ref_out, output.cpu(), atol=1e-3, rtol=1e-3)
+
+
 @gluon.jit
 def tensor_async_copy_kernel(a_ptr, b_ptr, M, N,  #
                              BLOCK_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr, NUM_BUFFERS: ttgl.constexpr):
