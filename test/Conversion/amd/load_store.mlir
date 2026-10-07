@@ -1,4 +1,6 @@
 // RUN: triton-opt %s -split-input-file --convert-scf-to-cf --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 --convert-builtin-func-to-llvm | FileCheck %s
+// RUN: triton-opt %s -split-input-file --convert-scf-to-cf --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 --convert-builtin-func-to-llvm | FileCheck %s
+// RUN: triton-opt %s -split-input-file --convert-scf-to-cf --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1200 --convert-builtin-func-to-llvm | FileCheck %s --check-prefix=NO-AV
 
 #blocked0 = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
@@ -53,33 +55,40 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
 
 // -----
 
-// .cv loads and .wt stores use the av intrinsics at system scope instead of
-// volatile accesses, except for widths the intrinsics do not support.
+// On CDNA3/CDNA4, .cv loads and .wt stores use the av intrinsics at system
+// scope instead of volatile accesses. Other targets keep the volatile accesses.
 #blocked4 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
   // CHECK-LABEL: load_cv_store_wt_av
+  // NO-AV-LABEL: load_cv_store_wt_av
+  // NO-AV-NOT: llvm.amdgcn.av
   tt.func @load_cv_store_wt_av(%src: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %dst16: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %dst8: !tt.ptr<i8> {tt.divisibility = 16 : i32}) {
     %range4 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32, #blocked4>
     %src_splat = tt.splat %src : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked4>
     %src_ptrs = tt.addptr %src_splat, %range4 : tensor<256x!tt.ptr<f32>, #blocked4>, tensor<256xi32, #blocked4>
     // CHECK: %[[MD:.*]] = llvm.mlir.metadata_as_value #llvm.md_node<#llvm.md_string<"">>
     // CHECK: llvm.call_intrinsic "llvm.amdgcn.av.load.b128"(%{{.*}}, %[[MD]]) : (!llvm.ptr<1>, !llvm.metadata) -> vector<4xi32>
+    // NO-AV: llvm.load volatile {{.*}} : !llvm.ptr<1> -> vector<4xf32>
     %x = tt.load %src_ptrs {cachePolicy = #tt.cache_policy<cache_modifier = cv, eviction_policy = evict_normal>} : tensor<256x!tt.ptr<f32>, #blocked4>
     %dst_splat = tt.splat %dst : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>, #blocked4>
     %dst_ptrs = tt.addptr %dst_splat, %range4 : tensor<256x!tt.ptr<f32>, #blocked4>, tensor<256xi32, #blocked4>
     // CHECK: llvm.call_intrinsic "llvm.amdgcn.av.store.b128"(%{{.*}}, %{{.*}}, %{{.*}}) : (!llvm.ptr<1>, vector<4xi32>, !llvm.metadata) -> ()
+    // NO-AV: llvm.store volatile {{.*}} : vector<4xf32>, !llvm.ptr<1>
     tt.store %dst_ptrs, %x {cachePolicy = #tt.cache_policy<cache_modifier = wt, eviction_policy = evict_normal>} : tensor<256x!tt.ptr<f32>, #blocked4>
     %h = arith.truncf %x : tensor<256xf32, #blocked4> to tensor<256xf16, #blocked4>
     %dst16_splat = tt.splat %dst16 : !tt.ptr<f16> -> tensor<256x!tt.ptr<f16>, #blocked4>
     %dst16_ptrs = tt.addptr %dst16_splat, %range4 : tensor<256x!tt.ptr<f16>, #blocked4>, tensor<256xi32, #blocked4>
-    // CHECK: llvm.call_intrinsic "llvm.amdgcn.av.store.b64"(%{{.*}}, %{{.*}}, %{{.*}}) : (!llvm.ptr<1>, i64, !llvm.metadata) -> ()
+    // CHECK: llvm.call_intrinsic "llvm.amdgcn.av.store.b64"(%{{.*}}, %{{.*}}, %{{.*}}) : (!llvm.ptr<1>, vector<2xi32>, !llvm.metadata) -> ()
+    // NO-AV: llvm.store volatile {{.*}} : vector<4xf16>, !llvm.ptr<1>
     tt.store %dst16_ptrs, %h {cachePolicy = #tt.cache_policy<cache_modifier = wt, eviction_policy = evict_normal>} : tensor<256x!tt.ptr<f16>, #blocked4>
     %range1 = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked1>
     %dst8_splat = tt.splat %dst8 : !tt.ptr<i8> -> tensor<64x!tt.ptr<i8>, #blocked1>
     %dst8_ptrs = tt.addptr %dst8_splat, %range1 : tensor<64x!tt.ptr<i8>, #blocked1>, tensor<64xi32, #blocked1>
     %bytes = arith.constant dense<1> : tensor<64xi8, #blocked1>
-    // CHECK: llvm.store volatile {{.*}} : vector<1xi8>, !llvm.ptr<1>
+    // CHECK: llvm.call_intrinsic "llvm.amdgcn.av.store.b8"(%{{.*}}, %{{.*}}, %{{.*}}) : (!llvm.ptr<1>, i8, !llvm.metadata) -> ()
+    // NO-AV: llvm.store volatile {{.*}} : vector<1xi8>, !llvm.ptr<1>
+    // NO-AV-NOT: llvm.amdgcn.av
     tt.store %dst8_ptrs, %bytes {cachePolicy = #tt.cache_policy<cache_modifier = wt, eviction_policy = evict_normal>} : tensor<64x!tt.ptr<i8>, #blocked1>
     tt.return
   }

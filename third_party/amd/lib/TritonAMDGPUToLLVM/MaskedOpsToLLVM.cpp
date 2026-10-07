@@ -19,6 +19,15 @@ using namespace mlir::triton::gpu;
 
 namespace {
 
+// av intrinsics helps to avoids unnecessary s_waitcnt on 
+// CDNA3/4. Other archs might benefit too, but we currently only
+// enable av intrinsics for CDNA3/4.
+bool supportsAVCacheModifiers(const AMD::TargetInfo &targetInfo) {
+  auto isaFamily = targetInfo.getISAFamily();
+  return isaFamily == triton::amdgpu::ISAFamily::CDNA3 ||
+         isaFamily == triton::amdgpu::ISAFamily::CDNA4;
+}
+
 struct AVIntrinsicType {
   Type type;
   unsigned bits;
@@ -41,12 +50,14 @@ std::optional<AVIntrinsicType> getAVIntrinsicType(Value ptr, Type ty) {
 
   MLIRContext *ctx = ty.getContext();
   switch (bits) {
+  case 8:
   case 16:
   case 32:
-  case 64:
     return AVIntrinsicType{IntegerType::get(ctx, bits), bits};
+  case 64:
   case 128:
-    return AVIntrinsicType{VectorType::get(4, IntegerType::get(ctx, 32)), bits};
+    return AVIntrinsicType{
+        VectorType::get(bits / 32, IntegerType::get(ctx, 32)), bits};
   default:
     return std::nullopt;
   }
@@ -89,7 +100,8 @@ public:
     // can emit the expected control bits without any waits. Loads explicitly
     // marked volatile keep the volatile load.
     auto avTy = getAVIntrinsicType(ptr, elemTy);
-    bool useAVLoad = avTy && cacheMod == triton::CacheModifier::CV &&
+    bool useAVLoad = supportsAVCacheModifiers(targetInfo) && avTy &&
+                     cacheMod == triton::CacheModifier::CV &&
                      !loadOp.getIsVolatile() && !loadOp.getForceNoAlias();
 
     auto createLoadWithAttrs = [&](Location loadLoc) -> Value {
@@ -178,7 +190,8 @@ private:
 class ConvertMaskedStoreOp
     : public OpRewritePattern<triton::amdgpu::MaskedStoreOp> {
 public:
-  using OpRewritePattern::OpRewritePattern;
+  ConvertMaskedStoreOp(MLIRContext *context, const AMD::TargetInfo &targetInfo)
+      : OpRewritePattern(context), targetInfo(targetInfo) {}
 
   LogicalResult matchAndRewrite(triton::amdgpu::MaskedStoreOp storeOp,
                                 PatternRewriter &rewriter) const override {
@@ -208,7 +221,8 @@ public:
     // on the other hand, can emit the expected control bits without any
     // waits.
     auto avTy = getAVIntrinsicType(ptr, elemTy);
-    bool useAVStore = avTy && storeOp.getCache() == triton::CacheModifier::WT &&
+    bool useAVStore = supportsAVCacheModifiers(targetInfo) && avTy &&
+                      storeOp.getCache() == triton::CacheModifier::WT &&
                       !storeOp.getForceNoAlias();
 
     auto createStoreWithAttrs = [&](Location storeLoc) {
@@ -253,6 +267,9 @@ public:
     rewriter.eraseOp(storeOp);
     return success();
   }
+
+private:
+  const AMD::TargetInfo &targetInfo;
 };
 
 } // namespace
@@ -262,7 +279,7 @@ namespace mlir::triton::AMD {
 void populateMaskedOpsToLLVMPatterns(RewritePatternSet &patterns,
                                      const TargetInfo &targetInfo) {
   patterns.add<ConvertMaskedLoadOp>(patterns.getContext(), targetInfo);
-  patterns.add<ConvertMaskedStoreOp>(patterns.getContext());
+  patterns.add<ConvertMaskedStoreOp>(patterns.getContext(), targetInfo);
 }
 } // namespace mlir::triton::AMD
 
