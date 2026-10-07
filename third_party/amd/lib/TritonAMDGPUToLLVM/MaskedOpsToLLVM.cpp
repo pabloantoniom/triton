@@ -11,12 +11,53 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/Sys/GetEnv.h"
+#include <optional>
 #include <tuple>
 
 using namespace mlir;
 using namespace mlir::triton::gpu;
 
 namespace {
+
+struct AVIntrinsicType {
+  Type type;
+  unsigned bits;
+};
+
+// Returns the type and width (the N in llvm.amdgcn.av.{load,store}.bN) of the
+// av intrinsic for an access of type `ty` through `ptr`, if there is one.
+std::optional<AVIntrinsicType> getAVIntrinsicType(Value ptr, Type ty) {
+  auto ptrTy = dyn_cast<LLVM::LLVMPointerType>(ptr.getType());
+  if (!ptrTy || (ptrTy.getAddressSpace() != 0 && ptrTy.getAddressSpace() != 1))
+    return std::nullopt;
+
+  Type elemTy = getElementTypeOrSelf(ty);
+  if (!elemTy.isIntOrFloat())
+    return std::nullopt;
+
+  unsigned bits = elemTy.getIntOrFloatBitWidth();
+  if (auto vecTy = dyn_cast<VectorType>(ty))
+    bits *= vecTy.getNumElements();
+
+  MLIRContext *ctx = ty.getContext();
+  switch (bits) {
+  case 16:
+  case 32:
+  case 64:
+    return AVIntrinsicType{IntegerType::get(ctx, bits), bits};
+  case 128:
+    return AVIntrinsicType{VectorType::get(4, IntegerType::get(ctx, 32)), bits};
+  default:
+    return std::nullopt;
+  }
+}
+
+Value createSystemScopeMetadata(RewriterBase &rewriter, Location loc) {
+  MLIRContext *ctx = rewriter.getContext();
+  auto scope = LLVM::MDNodeAttr::get(
+      ctx, {LLVM::MDStringAttr::get(ctx, StringAttr::get(ctx, ""))});
+  return LLVM::MetadataAsValueOp::create(rewriter, loc, scope);
+}
 
 class ConvertMaskedLoadOp
     : public OpRewritePattern<triton::amdgpu::MaskedLoadOp> {
@@ -40,6 +81,16 @@ public:
         mlir::LLVM::AMD::getCacheModifierFlagsForLoadStore(
             cacheMod, mlir::LLVM::AMD::MemoryOp::Load);
     volatileFlag |= loadOp.getIsVolatile();
+
+    // For cv cache modifier we want to use av intrinsics instead of regular
+    // load op. The reason is that the regular load op needs `volatile` in
+    // order to emit the expected control bits (sc0/sc1), but it also generates
+    // unnecessary s_waitcnt instructions. The av intrinsics, on the other hand,
+    // can emit the expected control bits without any waits. Loads explicitly
+    // marked volatile keep the volatile load.
+    auto avTy = getAVIntrinsicType(ptr, elemTy);
+    bool useAVLoad = avTy && cacheMod == triton::CacheModifier::CV &&
+                     !loadOp.getIsVolatile() && !loadOp.getForceNoAlias();
 
     auto createLoadWithAttrs = [&](Location loadLoc) -> Value {
       int vecBits = 0;
@@ -71,6 +122,14 @@ public:
         loadOp.emitRemark()
             << "Multicast with bit width " << vecBits << " is not supported on "
             << targetInfo.getArch() << " falling back to regular load";
+      }
+      if (useAVLoad) {
+        std::string intrinsic =
+            "llvm.amdgcn.av.load.b" + std::to_string(avTy->bits);
+        auto avLoad = LLVM::createLLVMIntrinsicCallOp(
+            rewriter, loadLoc, intrinsic, {avTy->type},
+            {ptr, createSystemScopeMetadata(rewriter, loadLoc)});
+        return b.bitcast(avLoad->getResult(0), elemTy);
       }
       // Emit a regular load
       auto load =
@@ -142,13 +201,32 @@ public:
       alignment = elemSizeInBytes * vecTy.getNumElements();
     }
 
-    auto createStoreWithAttrs = [&](Location storeLoc) -> LLVM::StoreOp {
+    // For wt cache modifier we want to use av intrinsics instead of
+    // regular store op. The reason is that the regular store op needs
+    // `volatile` in order to emit the expected control bits (sc0/sc1), but
+    // it also generates unnecessary s_waitcnt instructions. The av intrinsics,
+    // on the other hand, can emit the expected control bits without any
+    // waits.
+    auto avTy = getAVIntrinsicType(ptr, elemTy);
+    bool useAVStore = avTy && storeOp.getCache() == triton::CacheModifier::WT &&
+                      !storeOp.getForceNoAlias();
+
+    auto createStoreWithAttrs = [&](Location storeLoc) {
+      if (useAVStore) {
+        TritonLLVMOpBuilder b(storeLoc, rewriter);
+        std::string intrinsic =
+            "llvm.amdgcn.av.store.b" + std::to_string(avTy->bits);
+        LLVM::createLLVMIntrinsicCallOp(
+            rewriter, storeLoc, intrinsic, {},
+            {ptr, b.bitcast(val, avTy->type),
+             createSystemScopeMetadata(rewriter, storeLoc)});
+        return;
+      }
       auto store = LLVM::StoreOp::create(rewriter, storeLoc, val, ptr,
                                          alignment, volatileFlag, nonTmpFlag);
       if (storeOp.getForceNoAlias()) {
         AMD::addLocalLoadNoAliasScope(store);
       }
-      return store;
     };
 
     bool useDirectStore = mlir::matchPattern(mask, mlir::m_One());
